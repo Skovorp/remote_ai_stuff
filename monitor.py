@@ -3,7 +3,7 @@ import requests
 import time
 import hashlib
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
@@ -13,11 +13,17 @@ URL = "https://moscowfilmfestival.ru/miff48/schedule/"
 INTERVAL = 5
 OAI_KEY = os.environ["OAI_KEY"]
 
+MSK = timezone(timedelta(hours=3))
+
 oai = OpenAI(api_key=OAI_KEY)
 
 last_check_time = None
 last_check_status = None
 last_change_time = None
+
+
+def now_msk():
+    return datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
 
 
 def ask_gpt(page_text):
@@ -34,15 +40,23 @@ def ask_gpt(page_text):
         )
         return resp.choices[0].message.content
     except Exception as e:
-        print(f"GPT error: {e}")
+        error_msg = f"GPT error: {e}"
+        print(error_msg)
+        send_telegram(f"❌ <b>Ошибка GPT:</b>\n{e}")
         return None
 
 
 def send_telegram(text, chat_id=CHAT_ID):
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    resp = requests.post(api_url, data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
-    print(f"Telegram send to {chat_id}: {resp.status_code}")
-    return resp
+    try:
+        resp = requests.post(api_url, data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+        print(f"Telegram send to {chat_id}: {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"Telegram error body: {resp.text}")
+        return resp
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
+        return None
 
 
 def fetch_page():
@@ -69,13 +83,14 @@ def handle_test_fire(chat_id):
             max_tokens=1000,
         )
         analysis = resp.choices[0].message.content
-        msg = f"🧪 <b>Тестовый отчёт по странице ММКФ</b>\n\n{analysis}\n\n🔗 {URL}"
+        msg = f"🧪 <b>Тестовый отчёт по странице ММКФ</b>\n⏰ {now_msk()}\n\n{analysis}\n\n🔗 {URL}"
         if len(msg) > 4000:
             msg = msg[:4000] + "\n...(обрезано)"
         send_telegram(msg, chat_id=chat_id)
         print(f"test_fire отправлен в {chat_id}")
     except Exception as e:
         send_telegram(f"❌ Ошибка test_fire: {e}", chat_id=chat_id)
+        send_telegram(f"❌ <b>Ошибка test_fire</b> ({now_msk()}):\n{e}")
         print(f"test_fire ошибка: {e}")
 
 
@@ -117,6 +132,7 @@ def poll_commands():
                     handle_test_fire(chat)
         except Exception as e:
             print(f"Ошибка polling: {e}")
+            send_telegram(f"❌ <b>Ошибка polling команд</b> ({now_msk()}):\n{e}")
             time.sleep(5)
 
 
@@ -124,19 +140,21 @@ def main():
     global last_check_time, last_check_status, last_change_time
 
     print(f"Начинаю мониторинг: {URL}")
-    send_telegram(f"🤖 Бот запущен. Мониторю расписание ММКФ.\nИщу информацию о начале продажи билетов.\n{URL}")
+    send_telegram(f"🤖 Бот запущен ({now_msk()}).\nМониторю расписание ММКФ.\nИщу информацию о начале продажи билетов.\n{URL}")
 
     t = threading.Thread(target=poll_commands, daemon=True)
     t.start()
 
     prev_text = None
     prev_hash = None
+    consecutive_errors = 0
 
     while True:
         try:
             text = fetch_page()
+            consecutive_errors = 0
             h = hashlib.md5(text.encode()).hexdigest()
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = now_msk()
             last_check_time = now
 
             if prev_hash is None:
@@ -156,7 +174,7 @@ def main():
                 added = [l for l in new_lines if l not in old_lines]
                 removed = [l for l in old_lines if l not in new_lines]
 
-                msg = "🔔 <b>Расписание ММКФ изменилось!</b>\n"
+                msg = f"🔔 <b>Расписание ММКФ изменилось!</b>\n⏰ {now}\n"
 
                 if gpt_analysis:
                     msg += f"\n<b>Анализ GPT:</b>\n{gpt_analysis}\n"
@@ -179,8 +197,12 @@ def main():
                 print(f"Без изменений, hash={h[:12]}")
 
         except Exception as e:
+            consecutive_errors += 1
             last_check_status = f"❌ Ошибка: {e}"
             print(f"Ошибка: {e}")
+            # notify on first error and then every 60 errors (~5 min at 5s interval)
+            if consecutive_errors == 1 or consecutive_errors % 60 == 0:
+                send_telegram(f"❌ <b>Ошибка мониторинга</b> ({now_msk()}):\n{e}\n\nОшибок подряд: {consecutive_errors}")
 
         time.sleep(INTERVAL)
 
