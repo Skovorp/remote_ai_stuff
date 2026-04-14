@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = "5233511234"
+CHAT_ID = "-5233511234"
 URL = "https://moscowfilmfestival.ru/miff48/schedule/"
 INTERVAL = 5
 OAI_KEY = os.environ["OAI_KEY"]
