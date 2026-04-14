@@ -16,11 +16,16 @@ TARGETS = [
     {
         "name": "ММКФ расписание",
         "url": "https://moscowfilmfestival.ru/miff48/schedule/",
+        "display_url": "https://moscowfilmfestival.ru/miff48/schedule/",
+        "fetcher": "html",
         "context": "Московский Международный Кинофестиваль (ММКФ). Пользователь ждёт начала продажи билетов.",
     },
     {
         "name": "Каро 10 — 19 апреля 2026",
-        "url": "https://karofilm.ru/cinema/10?date=2026-04-19",
+        "url": "https://api.karofilm.ru/cinema-schedule?cinema_id=10",
+        "display_url": "https://karofilm.ru/cinema/10?date=2026-04-19",
+        "fetcher": "karo_api",
+        "filter_date": "2026-04-19",
         "context": "Кинотеатр Каро 10, расписание на 19 апреля 2026. Пользователь ждёт появления сеансов ММКФ и начала продажи билетов.",
     },
 ]
@@ -86,7 +91,7 @@ def ask_gpt(page_text, target):
         return None
 
 
-def fetch_page(url):
+def fetch_html(url):
     resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -95,14 +100,64 @@ def fetch_page(url):
     return soup.get_text(separator="\n", strip=True)
 
 
+def fetch_karo_api(url, filter_date):
+    """Fetch Karo API and return a stable text summary filtered to the target date."""
+    resp = requests.get(
+        url, timeout=30,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://karofilm.ru/", "Accept": "application/json"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    info = data.get("data", {}).get("info", {})
+    items = data.get("data", {}).get("items", [])
+
+    lines = [f"Кинотеатр: {info.get('name')} ({info.get('address')})"]
+    lines.append(f"Фильтр по дате: {filter_date}")
+    lines.append("")
+
+    matching_films = []
+    for item in items:
+        film_sessions = []
+        for fmt in item.get("formats", []):
+            for session in fmt.get("sessions", []):
+                if session.get("date") == filter_date:
+                    price = session.get("standard_price", 0)
+                    price_rub = price / 100 if price else 0
+                    film_sessions.append(
+                        f"  {session.get('time')} [{fmt.get('format_name')}] {price_rub:.0f} ₽"
+                    )
+        if film_sessions:
+            matching_films.append((item.get("name", "?"), film_sessions))
+
+    if not matching_films:
+        lines.append(f"НЕТ СЕАНСОВ на {filter_date}")
+    else:
+        lines.append(f"Найдено фильмов: {len(matching_films)}")
+        lines.append("")
+        matching_films.sort(key=lambda x: x[0])
+        for name, sessions in matching_films:
+            lines.append(f"🎬 {name}")
+            for s in sorted(sessions):
+                lines.append(s)
+
+    return "\n".join(lines)
+
+
+def fetch_target(target):
+    """Dispatch to the right fetcher for this target."""
+    if target.get("fetcher") == "karo_api":
+        return fetch_karo_api(target["url"], target["filter_date"])
+    return fetch_html(target["url"])
+
+
 def handle_test_fire(chat_id):
     """Fetch all pages, ask GPT for a report, send to chat."""
     send_telegram("⏳ Загружаю страницы и спрашиваю GPT...", chat_id=chat_id)
     for target in TARGETS:
         try:
-            text = fetch_page(target["url"])
+            text = fetch_target(target)
             analysis = ask_gpt(text, target)
-            msg = f"🧪 <b>Тестовый отчёт: {target['name']}</b>\n⏰ {now_msk()}\n\n{analysis}\n\n🔗 {target['url']}"
+            msg = f"🧪 <b>Тестовый отчёт: {target['name']}</b>\n⏰ {now_msk()}\n\n{analysis}\n\n🔗 {target['display_url']}"
             if len(msg) > 4000:
                 msg = msg[:4000] + "\n...(обрезано)"
             send_telegram(msg, chat_id=chat_id)
@@ -146,7 +201,7 @@ def poll_commands():
                             reply += f"Последнее изменение: {s['last_change_time']}\n"
                         else:
                             reply += "Изменений пока нет.\n"
-                        reply += f"🔗 {target['url']}\n"
+                        reply += f"🔗 {target['display_url']}\n"
                     send_telegram(reply, chat_id=chat)
                 elif cmd == "/test_fire":
                     handle_test_fire(chat)
@@ -159,11 +214,11 @@ def poll_commands():
 def monitor_target(target):
     """Monitor one target in a loop."""
     s = state[target["url"]]
-    print(f"Начинаю мониторинг: {target['name']} -> {target['url']}")
+    print(f"Начинаю мониторинг: {target['name']} -> {target['display_url']}")
 
     while True:
         try:
-            text = fetch_page(target["url"])
+            text = fetch_target(target)
             s["consecutive_errors"] = 0
             h = hashlib.md5(text.encode()).hexdigest()
             now = now_msk()
@@ -192,7 +247,7 @@ def monitor_target(target):
                     raw += "\n\n<b>Убрано:</b>\n" + "\n".join(removed[:20])
                 if not added and not removed:
                     raw += "\nИзменился порядок или форматирование контента."
-                raw += f"\n\n🔗 {target['url']}"
+                raw += f"\n\n🔗 {target['display_url']}"
                 if len(raw) > 4000:
                     raw = raw[:4000] + "\n...(обрезано)"
                 send_telegram(raw)
@@ -204,7 +259,7 @@ def monitor_target(target):
                 # second: GPT analysis as follow-up
                 gpt_analysis = ask_gpt(text, target)
                 if gpt_analysis:
-                    gpt_msg = f"🧠 <b>Анализ GPT: {target['name']}</b>\n\n{gpt_analysis}\n\n🔗 {target['url']}"
+                    gpt_msg = f"🧠 <b>Анализ GPT: {target['name']}</b>\n\n{gpt_analysis}\n\n🔗 {target['display_url']}"
                     if len(gpt_msg) > 4000:
                         gpt_msg = gpt_msg[:4000] + "\n...(обрезано)"
                     send_telegram(gpt_msg)
@@ -226,7 +281,7 @@ def monitor_target(target):
 
 
 def main():
-    urls_list = "\n".join(f"• {t['name']}: {t['url']}" for t in TARGETS)
+    urls_list = "\n".join(f"• {t['name']}: {t['display_url']}" for t in TARGETS)
     print(f"Начинаю мониторинг {len(TARGETS)} страниц")
     send_telegram(f"🤖 Бот запущен ({now_msk()}).\nМониторю:\n{urls_list}")
 
