@@ -9,41 +9,42 @@ from openai import OpenAI
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = "-5233511234"
-URL = "https://moscowfilmfestival.ru/miff48/schedule/"
 INTERVAL = 5
 OAI_KEY = os.environ["OAI_KEY"]
+
+TARGETS = [
+    {
+        "name": "ММКФ расписание",
+        "url": "https://moscowfilmfestival.ru/miff48/schedule/",
+        "context": "Московский Международный Кинофестиваль (ММКФ). Пользователь ждёт начала продажи билетов.",
+    },
+    {
+        "name": "Каро 10 — 19 апреля 2026",
+        "url": "https://karofilm.ru/cinema/10?date=2026-04-19",
+        "context": "Кинотеатр Каро 10, расписание на 19 апреля 2026. Пользователь ждёт появления сеансов ММКФ и начала продажи билетов.",
+    },
+]
 
 MSK = timezone(timedelta(hours=3))
 
 oai = OpenAI(api_key=OAI_KEY)
 
-last_check_time = None
-last_check_status = None
-last_change_time = None
+# state per target (keyed by url)
+state = {
+    t["url"]: {
+        "prev_text": None,
+        "prev_hash": None,
+        "last_check_time": None,
+        "last_check_status": None,
+        "last_change_time": None,
+        "consecutive_errors": 0,
+    }
+    for t in TARGETS
+}
 
 
 def now_msk():
     return datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
-
-
-def ask_gpt(page_text):
-    """Use GPT to analyze the current page state in Russian."""
-    try:
-        trimmed = page_text[:8000]
-        resp = oai.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": "Ты помощник, который анализирует страницу расписания Московского Международного Кинофестиваля. Пользователь ждёт начала продажи билетов. Проанализируй текст страницы и объясни кратко по-русски: что сейчас на странице, есть ли расписание, открыта ли продажа билетов. Если появилась информация о продаже билетов — выдели это БОЛЬШИМИ БУКВАМИ."},
-                {"role": "user", "content": f"Текст страницы расписания ММКФ:\n\n{trimmed}"}
-            ],
-            max_tokens=1000,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        error_msg = f"GPT error: {e}"
-        print(error_msg)
-        send_telegram(f"❌ <b>Ошибка GPT:</b>\n{e}")
-        return None
 
 
 def send_telegram(text, chat_id=CHAT_ID):
@@ -59,8 +60,34 @@ def send_telegram(text, chat_id=CHAT_ID):
         return None
 
 
-def fetch_page():
-    resp = requests.get(URL, timeout=30)
+def ask_gpt(page_text, target):
+    """Use GPT to analyze the current page state in Russian."""
+    try:
+        trimmed = page_text[:8000]
+        system = (
+            f"Ты помощник, который анализирует страницу: {target['name']}. "
+            f"Контекст: {target['context']} "
+            f"Проанализируй текст страницы и объясни кратко по-русски: "
+            f"что сейчас на странице, есть ли расписание, открыта ли продажа билетов. "
+            f"Если появилась информация о продаже билетов — выдели это БОЛЬШИМИ БУКВАМИ."
+        )
+        resp = oai.chat.completions.create(
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Текст страницы ({target['name']}):\n\n{trimmed}"}
+            ],
+            max_tokens=1000,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        print(f"GPT error: {e}")
+        send_telegram(f"❌ <b>Ошибка GPT</b> ({target['name']}):\n{e}")
+        return None
+
+
+def fetch_page(url):
+    resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
@@ -69,29 +96,19 @@ def fetch_page():
 
 
 def handle_test_fire(chat_id):
-    """Fetch page, ask GPT if ticket sales are open, send report."""
-    send_telegram("⏳ Загружаю страницу и спрашиваю GPT...", chat_id=chat_id)
-    try:
-        text = fetch_page()
-        trimmed = text[:8000]
-        resp = oai.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": "Ты помощник, который анализирует страницу расписания Московского Международного Кинофестиваля (ММКФ). Пользователь ждёт начала продажи билетов. Проанализируй текст страницы и ответь по-русски: 1) Открыта ли продажа билетов? 2) Есть ли кнопки/ссылки на покупку? 3) Какие фильмы/события есть в расписании? 4) Общее состояние страницы. Если продажа билетов открыта — выдели это БОЛЬШИМИ БУКВАМИ."},
-                {"role": "user", "content": f"Вот текст страницы расписания ММКФ:\n\n{trimmed}"}
-            ],
-            max_tokens=1000,
-        )
-        analysis = resp.choices[0].message.content
-        msg = f"🧪 <b>Тестовый отчёт по странице ММКФ</b>\n⏰ {now_msk()}\n\n{analysis}\n\n🔗 {URL}"
-        if len(msg) > 4000:
-            msg = msg[:4000] + "\n...(обрезано)"
-        send_telegram(msg, chat_id=chat_id)
-        print(f"test_fire отправлен в {chat_id}")
-    except Exception as e:
-        send_telegram(f"❌ Ошибка test_fire: {e}", chat_id=chat_id)
-        send_telegram(f"❌ <b>Ошибка test_fire</b> ({now_msk()}):\n{e}")
-        print(f"test_fire ошибка: {e}")
+    """Fetch all pages, ask GPT for a report, send to chat."""
+    send_telegram("⏳ Загружаю страницы и спрашиваю GPT...", chat_id=chat_id)
+    for target in TARGETS:
+        try:
+            text = fetch_page(target["url"])
+            analysis = ask_gpt(text, target)
+            msg = f"🧪 <b>Тестовый отчёт: {target['name']}</b>\n⏰ {now_msk()}\n\n{analysis}\n\n🔗 {target['url']}"
+            if len(msg) > 4000:
+                msg = msg[:4000] + "\n...(обрезано)"
+            send_telegram(msg, chat_id=chat_id)
+        except Exception as e:
+            send_telegram(f"❌ Ошибка test_fire ({target['name']}): {e}", chat_id=chat_id)
+            print(f"test_fire ошибка {target['name']}: {e}")
 
 
 def poll_commands():
@@ -114,19 +131,22 @@ def poll_commands():
                 chat = msg.get("chat", {}).get("id")
                 if not chat:
                     continue
-                cmd = text.strip()
+                cmd = text.strip().split("@")[0]  # strip @botname suffix in groups
                 if cmd == "/check":
-                    reply = "📊 <b>Статус мониторинга</b>\n\n"
-                    if last_check_time:
-                        reply += f"Последняя проверка: <b>{last_check_time}</b>\n"
-                        reply += f"Статус: {last_check_status}\n"
-                    else:
-                        reply += "Ещё ни одной проверки не было.\n"
-                    if last_change_time:
-                        reply += f"\nПоследнее изменение: <b>{last_change_time}</b>"
-                    else:
-                        reply += "\nИзменений пока не обнаружено."
-                    reply += f"\n\n🔗 {URL}"
+                    reply = f"📊 <b>Статус мониторинга</b>\n⏰ {now_msk()}\n"
+                    for target in TARGETS:
+                        s = state[target["url"]]
+                        reply += f"\n<b>{target['name']}</b>\n"
+                        if s["last_check_time"]:
+                            reply += f"Проверка: {s['last_check_time']}\n"
+                            reply += f"Статус: {s['last_check_status']}\n"
+                        else:
+                            reply += "Ещё не проверялось.\n"
+                        if s["last_change_time"]:
+                            reply += f"Последнее изменение: {s['last_change_time']}\n"
+                        else:
+                            reply += "Изменений пока нет.\n"
+                        reply += f"🔗 {target['url']}\n"
                     send_telegram(reply, chat_id=chat)
                 elif cmd == "/test_fire":
                     handle_test_fire(chat)
@@ -136,75 +156,85 @@ def poll_commands():
             time.sleep(5)
 
 
-def main():
-    global last_check_time, last_check_status, last_change_time
-
-    print(f"Начинаю мониторинг: {URL}")
-    send_telegram(f"🤖 Бот запущен ({now_msk()}).\nМониторю расписание ММКФ.\nИщу информацию о начале продажи билетов.\n{URL}")
-
-    t = threading.Thread(target=poll_commands, daemon=True)
-    t.start()
-
-    prev_text = None
-    prev_hash = None
-    consecutive_errors = 0
+def monitor_target(target):
+    """Monitor one target in a loop."""
+    s = state[target["url"]]
+    print(f"Начинаю мониторинг: {target['name']} -> {target['url']}")
 
     while True:
         try:
-            text = fetch_page()
-            consecutive_errors = 0
+            text = fetch_page(target["url"])
+            s["consecutive_errors"] = 0
             h = hashlib.md5(text.encode()).hexdigest()
             now = now_msk()
-            last_check_time = now
+            s["last_check_time"] = now
 
-            if prev_hash is None:
-                prev_hash = h
-                prev_text = text
-                last_check_status = f"✅ Первый снимок сохранён (hash: {h[:12]})"
-                print(f"Первый снимок сохранён, hash={h[:12]}")
-            elif h != prev_hash:
-                print(f"Обнаружено изменение! {prev_hash[:12]} -> {h[:12]}")
-                last_check_status = f"🔔 Обнаружено изменение!"
-                last_change_time = now
+            if s["prev_hash"] is None:
+                s["prev_hash"] = h
+                s["prev_text"] = text
+                s["last_check_status"] = f"✅ Первый снимок (hash: {h[:12]})"
+                print(f"[{target['name']}] Первый снимок, hash={h[:12]}")
+            elif h != s["prev_hash"]:
+                print(f"[{target['name']}] Изменение! {s['prev_hash'][:12]} -> {h[:12]}")
+                s["last_check_status"] = "🔔 Обнаружено изменение!"
+                s["last_change_time"] = now
 
-                gpt_analysis = ask_gpt(text)
+                gpt_analysis = ask_gpt(text, target)
 
-                old_lines = prev_text.splitlines()
+                old_lines = s["prev_text"].splitlines()
                 new_lines = text.splitlines()
                 added = [l for l in new_lines if l not in old_lines]
                 removed = [l for l in old_lines if l not in new_lines]
 
-                msg = f"🔔 <b>Расписание ММКФ изменилось!</b>\n⏰ {now}\n"
-
+                msg = f"🔔 <b>Изменилось: {target['name']}</b>\n⏰ {now}\n"
                 if gpt_analysis:
                     msg += f"\n<b>Анализ GPT:</b>\n{gpt_analysis}\n"
-
                 if added:
                     msg += "\n<b>Добавлено:</b>\n" + "\n".join(added[:20])
                 if removed:
                     msg += "\n\n<b>Убрано:</b>\n" + "\n".join(removed[:20])
-
-                msg += f"\n\n🔗 {URL}"
+                msg += f"\n\n🔗 {target['url']}"
 
                 if len(msg) > 4000:
                     msg = msg[:4000] + "\n...(обрезано)"
 
                 send_telegram(msg)
-                prev_hash = h
-                prev_text = text
+                s["prev_hash"] = h
+                s["prev_text"] = text
             else:
-                last_check_status = f"✅ Без изменений (hash: {h[:12]})"
-                print(f"Без изменений, hash={h[:12]}")
+                s["last_check_status"] = f"✅ Без изменений (hash: {h[:12]})"
+                print(f"[{target['name']}] Без изменений, hash={h[:12]}")
 
         except Exception as e:
-            consecutive_errors += 1
-            last_check_status = f"❌ Ошибка: {e}"
-            print(f"Ошибка: {e}")
-            # notify on first error and then every 60 errors (~5 min at 5s interval)
-            if consecutive_errors == 1 or consecutive_errors % 60 == 0:
-                send_telegram(f"❌ <b>Ошибка мониторинга</b> ({now_msk()}):\n{e}\n\nОшибок подряд: {consecutive_errors}")
+            s["consecutive_errors"] += 1
+            s["last_check_status"] = f"❌ Ошибка: {e}"
+            print(f"[{target['name']}] Ошибка: {e}")
+            if s["consecutive_errors"] == 1 or s["consecutive_errors"] % 60 == 0:
+                send_telegram(
+                    f"❌ <b>Ошибка мониторинга</b> ({target['name']}, {now_msk()}):\n{e}\n\n"
+                    f"Ошибок подряд: {s['consecutive_errors']}"
+                )
 
         time.sleep(INTERVAL)
+
+
+def main():
+    urls_list = "\n".join(f"• {t['name']}: {t['url']}" for t in TARGETS)
+    print(f"Начинаю мониторинг {len(TARGETS)} страниц")
+    send_telegram(f"🤖 Бот запущен ({now_msk()}).\nМониторю:\n{urls_list}")
+
+    # start command polling
+    threading.Thread(target=poll_commands, daemon=True).start()
+
+    # start one monitor thread per target, main thread waits on the first
+    threads = []
+    for target in TARGETS[1:]:
+        t = threading.Thread(target=monitor_target, args=(target,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # run first target on main thread (blocks forever)
+    monitor_target(TARGETS[0])
 
 
 if __name__ == "__main__":
