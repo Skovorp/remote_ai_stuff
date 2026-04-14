@@ -179,28 +179,35 @@ def monitor_target(target):
                 s["last_check_status"] = "🔔 Обнаружено изменение!"
                 s["last_change_time"] = now
 
-                gpt_analysis = ask_gpt(text, target)
-
                 old_lines = s["prev_text"].splitlines()
                 new_lines = text.splitlines()
                 added = [l for l in new_lines if l not in old_lines]
                 removed = [l for l in old_lines if l not in new_lines]
 
-                msg = f"🔔 <b>Изменилось: {target['name']}</b>\n⏰ {now}\n"
-                if gpt_analysis:
-                    msg += f"\n<b>Анализ GPT:</b>\n{gpt_analysis}\n"
+                # first: raw change alert (fires even if GPT fails later)
+                raw = f"🔔 <b>Изменилось: {target['name']}</b>\n⏰ {now}\n"
                 if added:
-                    msg += "\n<b>Добавлено:</b>\n" + "\n".join(added[:20])
+                    raw += "\n<b>Добавлено:</b>\n" + "\n".join(added[:20])
                 if removed:
-                    msg += "\n\n<b>Убрано:</b>\n" + "\n".join(removed[:20])
-                msg += f"\n\n🔗 {target['url']}"
+                    raw += "\n\n<b>Убрано:</b>\n" + "\n".join(removed[:20])
+                if not added and not removed:
+                    raw += "\nИзменился порядок или форматирование контента."
+                raw += f"\n\n🔗 {target['url']}"
+                if len(raw) > 4000:
+                    raw = raw[:4000] + "\n...(обрезано)"
+                send_telegram(raw)
 
-                if len(msg) > 4000:
-                    msg = msg[:4000] + "\n...(обрезано)"
-
-                send_telegram(msg)
+                # update state BEFORE calling GPT so a GPT hang doesn't re-fire the same change
                 s["prev_hash"] = h
                 s["prev_text"] = text
+
+                # second: GPT analysis as follow-up
+                gpt_analysis = ask_gpt(text, target)
+                if gpt_analysis:
+                    gpt_msg = f"🧠 <b>Анализ GPT: {target['name']}</b>\n\n{gpt_analysis}\n\n🔗 {target['url']}"
+                    if len(gpt_msg) > 4000:
+                        gpt_msg = gpt_msg[:4000] + "\n...(обрезано)"
+                    send_telegram(gpt_msg)
             else:
                 s["last_check_status"] = f"✅ Без изменений (hash: {h[:12]})"
                 print(f"[{target['name']}] Без изменений, hash={h[:12]}")
